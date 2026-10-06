@@ -1,0 +1,334 @@
+#!/usr/bin/env python3
+"""[修三] 签名产物缓存层(horosa_repro_sign_cache_v1)。
+
+问题:`sign_runtime_payload.py` 用 `codesign --force --timestamp --options runtime`,
+`--timestamp` 每次向 Apple 时间戳服务器请求 ⇒ **同一份字节、同一身份,签出来也每次不同**。
+实测:py-runtime 两次打包 219 个文件内容变(187 .so + 26 .dylib + Python 主程序 +
+bin/python3.12* + _CodeSignature/CodeResources),导致 113MB 部件每版被判「变了」全量重下。
+`--timestamp` 不能去掉——公证强制要求安全时间戳,去掉必然公证失败。
+
+做法:本脚本包在原签名脚本外面(原脚本一行不改),
+  ① 签名前给待签树做文件级 sha 快照(排除 java/ —— 原脚本 SKIP_DIR_NAMES 跳过它);
+  ② 用「快照 + 签名身份 + 签名器的 codesign 参数模板与语义代次(SIGNER_CACHE_EPOCH)+ 本层代次」算缓存键
+     (此前掺的是两个脚本的全文 sha:任何一处改动 —— 哪怕只是加一行注释 —— 都作废全部缓存,内容未变的
+     py-runtime 118 MB 整版重签重下,v3.11.2 打包实抓;签名器缺这两个量时退回全文 sha 的保守形态);
+  ③ 命中 ⇒ 把缓存里的签名后文件逐一拷回,跳过 codesign(省数分钟且产物字节恒等);
+  ④ 未命中 ⇒ 调原脚本真签,再对比签名前后快照、把**发生变化的文件**存进缓存。
+
+安全性:复用的签名与重签的唯一差别只是时间戳时刻——同身份、同参数、对同一字节内容签出。
+任一输入变化(树内容/身份/任一脚本)都会改变缓存键而不命中。Apple 时间戳证书有效期很长,
+且公证针对的是每次新产出的 .pkg;Gatekeeper 校验签名有效性而非新鲜度。发布链的
+`stapler validate` + `spctl` + 离线 pkg 真装 e2e 三道门是这条的实测背书。
+
+kill-switch:HOROSA_SIGN_CACHE=0 ⇒ 完全旁路(每次真签,行为与本脚本引入前逐字节一致)。
+"""
+import hashlib
+import json
+import os
+import pathlib
+import shutil
+import subprocess
+import sys
+
+SKIP_DIR_NAMES = {"java"}  # 与 sign_runtime_payload.py 的 SKIP_DIR_NAMES 保持一致
+CACHE_KEEP = 2             # 只保留最近 N 个键的缓存(构建机磁盘友好)
+CACHE_LAYER_EPOCH = "1"    # 本层(快照口径 / 复用逻辑)的语义代次;只在复用语义变化时升,纯重构不升
+
+# 🔴 缓存键只能纳入「签名真会碰的文件」。任何与签名结果无关、又本身不可复现的文件混进键,
+# 都会让键每次都变、缓存永不命中。实测连踩两次:
+#   ① `.app-cds.jsa`(CDS 预置档,在签名前落进待签树)每次 dump 都不同;
+#   ② 打包现场 precompile 的 `.pyc` 里也有内容会变的个例。
+# 两次都表现为「键 A→B 每次不同、py-runtime 照旧每版重下」。
+# 正解不是逐类拉黑,而是**白名单**:键只纳入原签名脚本三个枚举器会选中的对象
+# (Mach-O 文件 + .jar/.zip 归档)。判定直接从原脚本动态 import,永远同源不漂。
+KEY_EXCLUDE_SUFFIXES = (".jsa",)  # 保留:即便未来白名单放宽,这类档也永不入键
+
+
+def _sha_file(path: pathlib.Path) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _skipped(rel: pathlib.PurePath) -> bool:
+    return any(part in SKIP_DIR_NAMES for part in rel.parts)
+
+
+def snapshot(root: pathlib.Path) -> dict:
+    """待签树的文件级快照:{相对路径: sha}。符号链接按其目标路径字符串记账(签名不改链接)。"""
+    out = {}
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            p = pathlib.Path(dirpath) / fn
+            rel = p.relative_to(root)
+            if _skipped(rel):
+                continue
+            try:
+                if p.is_symlink():
+                    out[str(rel)] = "L:" + os.readlink(p)
+                elif p.is_file():
+                    out[str(rel)] = _sha_file(p)
+            except OSError:
+                pass
+    return out
+
+
+def load_signer_module(signer_path: str):
+    """动态载入原签名脚本,复用它的 is_macho / ARCHIVE_SUFFIXES —— 判定永远与真实签名同源。
+    载入失败或符号缺失一律返回 None ⇒ 键退回「全量(除 .jsa)」的保守形态:可能少命中,
+    但绝不误命中、更不会让打包崩。"""
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location("horosa_signer", signer_path)
+        mod = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(mod)
+        if callable(getattr(mod, "is_macho", None)) and getattr(mod, "ARCHIVE_SUFFIXES", None):
+            return mod
+    except Exception as exc:  # noqa: BLE001 —— 任何异常都退保守路径,不阻断打包
+        print(f"[sign-cache] 载入签名脚本判定失败({exc!r}),键退回保守全量形态", flush=True)
+        return None
+    print("[sign-cache] 签名脚本缺 is_macho/ARCHIVE_SUFFIXES,键退回保守全量形态", flush=True)
+    return None
+
+
+def key_relevant(snap: dict, root: pathlib.Path, signer_mod) -> dict:
+    """键只纳入签名真会碰的对象:Mach-O 文件 + .jar/.zip 归档(白名单,见上方注释)。
+    signer_mod 为 None(判定不可用)时退回保守全量形态。"""
+    out = {}
+    for rel, val in snap.items():
+        if rel.endswith(KEY_EXCLUDE_SUFFIXES) or val.startswith("L:"):
+            continue
+        if signer_mod is None:
+            out[rel] = val
+            continue
+        p = root / rel
+        if p.suffix.lower() in signer_mod.ARCHIVE_SUFFIXES or signer_mod.is_macho(p):
+            out[rel] = val
+    return out
+
+
+def _sig_derived(rel: str) -> bool:
+    """签名派生文件(_CodeSignature/CodeResources 等):codesign 生成,签名前树里不存在。"""
+    return "_CodeSignature" in pathlib.PurePath(rel).parts
+
+
+def try_seed(seed_root: pathlib.Path, root: pathlib.Path, before: dict, keyed: dict) -> int:
+    """[修三 v2 · seed 预灌] 用外部已签名产物树(如线上已发布部件 tar 解包)充当本次签名产物,
+    让「内容未变」的域当版即与线上字节恒等(不必等下一版才命中缓存)。
+    安全闸(三重):
+      ① 键面文件(签名会重写的 Mach-O/归档)在 seed 里必须齐全;
+      ② 内容面文件(签名不碰的 .py/资源等,即 before 中的全部非键面非链接项)在 seed 与本树
+         必须逐字节同 —— 任何一个不同 ⇒ seed 来源版本与本树内容不一致,整体拒用;
+      ③ 后置既有四门(codesign --verify / stapler / spctl / 净化 e2e)对最终产物硬校验。
+    返回拷贝文件数;不适用返回 -1(回落真签,绝不半用)。"""
+    if not seed_root.is_dir():
+        print(f"[sign-cache] seed 拒因: 域目录不存在 {seed_root}", flush=True)
+        return -1
+    for rel in keyed:
+        if not (seed_root / rel).is_file():
+            print(f"[sign-cache] seed 拒因: 键面文件缺失 {rel}", flush=True)
+            return -1
+    for rel, val in before.items():
+        if rel in keyed or val.startswith("L:") or _sig_derived(rel):
+            continue
+        sp = seed_root / rel
+        if not sp.is_file():
+            print(f"[sign-cache] seed 拒因: 内容面文件缺失 {rel}", flush=True)
+            return -1
+        if _sha_file(sp) != val:
+            print(f"[sign-cache] seed 拒因: 内容面不一致 {rel}", flush=True)
+            return -1
+    n = 0
+    for rel in sorted(keyed):
+        src = seed_root / rel
+        dst = root / rel
+        _put_signed(src, dst)
+        n += 1
+    # 签名派生文件(签名前树无):从 seed 整套带回,与键面签名配套。
+    for dirpath, dirnames, filenames in os.walk(seed_root):
+        dirnames.sort()
+        for fn in sorted(filenames):
+            p = pathlib.Path(dirpath) / fn
+            rel = str(p.relative_to(seed_root))
+            if not _sig_derived(rel):
+                continue
+            dst = root / rel
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            _unlink_force(dst)
+            shutil.copy2(p, dst)
+            n += 1
+    return n
+
+
+def signer_salt(signer_mod, signer_path: str) -> str:
+    """缓存键里代表「签名器」的那一份:优先签名器自报的参数模板 + 语义代次;签名器没有(旧版)则退回全文 sha(保守)。"""
+    salt = getattr(signer_mod, "signer_cache_salt", None) if signer_mod is not None else None
+    if callable(salt):
+        try:
+            return "salt:" + str(salt())
+        except Exception:  # noqa: BLE001
+            pass
+    try:
+        return "sha:" + _sha_file(pathlib.Path(signer_path))
+    except OSError:
+        return "sha:missing"
+
+
+def cache_key(snap: dict, identity: str, salt: str) -> str:
+    h = hashlib.sha256()
+    h.update(b"horosa_repro_sign_cache_v2\n")
+    h.update(identity.encode("utf-8") + b"\n")
+    h.update(salt.encode("utf-8") + b"\n")
+    h.update(("layer=" + CACHE_LAYER_EPOCH).encode("utf-8") + b"\n")
+    for rel in sorted(snap):
+        h.update(rel.encode("utf-8") + b"\0" + snap[rel].encode("utf-8") + b"\n")
+    return h.hexdigest()
+
+
+def _mode_of(path: pathlib.Path):
+    """暂存树里目标档的权限位(不跟随符号链接);不存在回 None。"""
+    try:
+        if path.is_symlink() or not path.exists():
+            return None
+        return path.stat().st_mode & 0o7777
+    except OSError:
+        return None
+
+
+def _put_signed(src: pathlib.Path, dst: pathlib.Path) -> None:
+    """把签名产物放回暂存树:内容取 src,权限位保留 dst 原有的(codesign 不改权限,产物权限必须 = 暂存树的)。
+    v3.11.2 实抓:种子树是不带 -p 解出来的,74 个 .so 被 umask 降成 0755,copy2 连权限一起带进包 ⇒ 部件 sha 漂。"""
+    mode = _mode_of(dst)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    _unlink_force(dst)
+    shutil.copy2(src, dst)
+    if mode is not None:
+        try:
+            os.chmod(dst, mode)
+        except OSError:
+            pass
+
+
+def _unlink_force(path: pathlib.Path) -> None:
+    """摘掉目标档(含只读档);不存在则静默。"""
+    try:
+        if path.is_symlink() or path.exists():
+            try:
+                path.unlink()
+            except PermissionError:
+                os.chmod(path, 0o644)
+                path.unlink()
+    except OSError:
+        pass
+
+
+def restore(cache_dir: pathlib.Path, root: pathlib.Path) -> int:
+    """把缓存里的签名后文件拷回原位。返回恢复文件数;任一缺失即返回 -1(视为未命中)。"""
+    manifest = json.loads((cache_dir / "manifest.json").read_text())
+    files = manifest["files"]
+    for rel in files:
+        src = cache_dir / "files" / rel
+        if not src.is_file():
+            return -1
+    n = 0
+    for rel in files:
+        src = cache_dir / "files" / rel
+        dst = root / rel
+        # 🔴 目标可能是只读档(实测 libtcl8.6.dylib 等按 444 落盘),直接 open(dst,'wb') 会
+        # PermissionError 崩掉整个打包。先摘掉旧档再拷;权限位保留暂存树原有的(_put_signed)。
+        _put_signed(src, dst)
+        n += 1
+    return n
+
+
+def store(cache_dir: pathlib.Path, root: pathlib.Path, changed: list, keyed: dict = None) -> None:
+    files_dir = cache_dir / "files"
+    for rel in changed:
+        src = root / rel
+        if not src.is_file() or src.is_symlink():
+            continue
+        dst = files_dir / rel
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(src, dst)
+    payload = {"version": 2, "files": changed}
+    if keyed is not None:
+        payload["keyed"] = keyed   # 键面快照(未签名内容 sha):将来换键公式时可按内容再定位这份产物
+    tmp = cache_dir / "manifest.json.tmp"
+    tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=1) + "\n")
+    tmp.replace(cache_dir / "manifest.json")
+
+
+def prune(cache_root: pathlib.Path, keep: int) -> None:
+    try:
+        dirs = [d for d in cache_root.iterdir() if d.is_dir() and (d / "manifest.json").is_file()]
+    except OSError:
+        return
+    dirs.sort(key=lambda d: d.stat().st_mtime, reverse=True)
+    for d in dirs[keep:]:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def main() -> int:
+    if len(sys.argv) < 5:
+        print("usage: sign_payload_cached.py <signer.py> <root> <identity> <keychain> <cache_root>", file=sys.stderr)
+        return 2
+    signer, root_s, identity, keychain, cache_root_s = sys.argv[1:6]
+    root = pathlib.Path(root_s).resolve()
+    cache_root = pathlib.Path(cache_root_s)
+
+    def real_sign():
+        cmd = ["/usr/bin/python3", signer, str(root), "--identity", identity]
+        if keychain:
+            cmd += ["--keychain", keychain]
+        subprocess.run(cmd, check=True)
+
+    if os.environ.get("HOROSA_SIGN_CACHE", "1") != "1":
+        print("[sign-cache] 已关闭(HOROSA_SIGN_CACHE=0),走原始每次真签路径", flush=True)
+        real_sign()
+        return 0
+
+    before = snapshot(root)
+    signer_mod = load_signer_module(signer)
+    keyed = key_relevant(before, root, signer_mod)
+    key = cache_key(keyed, identity, signer_salt(signer_mod, signer))
+    cache_dir = cache_root / key
+    print(f"[sign-cache] key={key[:16]} 签名面 {len(keyed)} 个 Mach-O/归档"
+          f"(树内共 {len(before)} 文件,其余与签名无关不入键)", flush=True)
+
+    if (cache_dir / "manifest.json").is_file():
+        n = restore(cache_dir, root)
+        if n >= 0:
+            os.utime(cache_dir, None)  # 刷新 LRU 时间戳
+            print(f"[sign-cache] ✅ 命中,复用签名产物 {n} 个文件(跳过 codesign;产物字节与上次恒等)", flush=True)
+            return 0
+        print("[sign-cache] 缓存残缺,回退真签", flush=True)
+
+    seeded = False
+    seed_root_s = os.environ.get("HOROSA_SIGN_SEED_DIR", "")
+    if seed_root_s:
+        seed_root = pathlib.Path(seed_root_s) / root.name
+        n = try_seed(seed_root, root, before, keyed)
+        if n >= 0:
+            seeded = True
+            print(f"[sign-cache] 🌱 seed 命中({seed_root}),复用外部签名产物 {n} 个文件(跳过 codesign;与外部产物字节恒等)", flush=True)
+        else:
+            print(f"[sign-cache] seed 不适用({seed_root}:域缺失/键面不全/内容面不一致),忽略走真签", flush=True)
+
+    if not seeded:
+        print("[sign-cache] 未命中,执行真实签名…", flush=True)
+        real_sign()
+    after = snapshot(root)
+    changed = sorted(rel for rel, sha in after.items()
+                     if before.get(rel) != sha and not sha.startswith("L:"))
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    store(cache_dir, root, changed, keyed)
+    prune(cache_root, CACHE_KEEP)
+    print(f"[sign-cache] 已缓存签名产物 {len(changed)} 个文件 → {cache_dir.name[:16]}", flush=True)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

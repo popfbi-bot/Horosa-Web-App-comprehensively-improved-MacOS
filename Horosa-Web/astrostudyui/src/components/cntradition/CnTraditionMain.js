@@ -1,0 +1,136 @@
+import { Component } from 'react';
+import { wrapperPropsEqual } from '../../utils/chartUpdateGuard';
+import { XQTabs as Tabs } from '../xq-ui';
+import { randomStr } from '../../utils/helper';
+import { CNTRADITION_SUBTABS, rememberSubTab } from '../../constants/SubTabRegistry';
+import GuaSymDesc from '../gua/GuaSymDesc';
+import TechniqueErrorBoundary from '../common/TechniqueErrorBoundary';
+import CuanGong12 from '../commtools/CuanGong12';
+import BaziPithy from '../commtools/BaziPithy';
+
+const TabPane = Tabs.TabPane;
+
+class CnTraditionMain extends Component{
+	// [R3-A6] 渲染守卫:宿主无关 dispatch 不再全树重渲(nextState 引用变照常放行;
+	// 开关 horosa.perf.chartSCU,语义详 chartUpdateGuard.wrapperPropsEqual)。
+	shouldComponentUpdate(nextProps, nextState){
+		if(nextState !== this.state){
+			return true;
+		}
+		return !wrapperPropsEqual(this.props, nextProps);
+	}
+
+
+	constructor(props) {
+		super(props);
+
+		const subtab = this.props.currentSubTab ? this.props.currentSubTab : 'guasym';
+		const tab = CNTRADITION_SUBTABS.indexOf(subtab) >= 0 ? subtab : 'guasym';
+		rememberSubTab('cntradition', tab, CNTRADITION_SUBTABS);
+		this.state = {
+			divId: 'div_' + randomStr(8),
+			currentTab: tab,
+			hook:{
+				guasym:{
+					fun: null
+				},
+				cuangong12: {
+					fun: null
+				},
+				pithy: {
+					fun: null
+				},
+			},
+		};
+
+		this.changeTab = this.changeTab.bind(this);
+		this.findTab = this.findTab.bind(this);
+
+		if(this.props.hook){
+			this.props.hook.fun = (fields)=>{
+				let hook = this.state.hook;
+				let subtab = this.findTab();
+				if(hook[subtab] && hook[subtab].fun){
+					hook[subtab].fun(fields);
+				}
+				setTimeout(()=>{
+					if(this.props.dispatch){
+						this.props.dispatch({
+							type: 'astro/save',
+							payload: {
+								currentSubTab: subtab,
+							}
+						});
+					}			
+				}, 500);
+			};
+		}
+
+	}
+
+	findTab(){
+		let subtab = this.state.currentTab ? this.state.currentTab : 'guasym';
+		for(let key in this.state.hook){
+			if(key === subtab){
+				return key;
+			}
+		}
+		let key = 'guasym';
+		return key;
+	}
+
+	changeTab(key){
+		let hook = this.state.hook;
+		rememberSubTab('cntradition', key, CNTRADITION_SUBTABS);
+		this.setState({
+			currentTab: key,
+		}, ()=>{
+			if(hook[key].fun){
+				hook[key].fun(this.props.fields);
+			}
+			if(this.props.dispatch){
+				this.props.dispatch({
+					type: 'astro/save',
+					payload: {
+						currentSubTab: key,
+					}
+				});
+			}	
+		});
+	}
+
+
+	render(){
+		// 根 Tabs 改充满父面板（原 props.height-20 定死像素高 → 底部黑条）。
+		// 三个子页一律 fill:整条 Tabs 内容链定高(app.less)+ 叶子按容器定高。此前叶子无 height 入参时退
+		// documentElement.clientHeight − 常数(物理域)→ 缩小档底部死带、放大档溢出被裁且滚不到。
+		let tab = this.findTab();
+
+		return (
+			<div id={this.state.divId} className="horosa-cntradition-page">
+				<Tabs
+					defaultActiveKey={tab} tabPosition='right'
+					className="xq-tabs-rail"
+					activeKey={tab}
+					onChange={this.changeTab}
+					style={{ height: '100%', minHeight: 0 }}
+				>
+					<TabPane tab="八卦类象" key="guasym">
+						<TechniqueErrorBoundary label="八卦类象"><GuaSymDesc fill /></TechniqueErrorBoundary>
+					</TabPane>
+
+					<TabPane tab="十二串宫" key="cuangong12">
+						<TechniqueErrorBoundary label="十二串宫"><CuanGong12 fill /></TechniqueErrorBoundary>
+					</TabPane>
+
+					<TabPane tab="八字规则" key="pithy">
+						<TechniqueErrorBoundary label="八字规则"><BaziPithy fill /></TechniqueErrorBoundary>
+					</TabPane>
+
+				</Tabs>
+			</div>
+		);
+	}
+}
+
+export default CnTraditionMain;

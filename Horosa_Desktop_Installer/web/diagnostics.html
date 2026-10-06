@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>诊断中心</title>
+    <link rel="stylesheet" href="./diagnostics.css" />
+  </head>
+  <body>
+    <main class="diag-shell">
+      <header class="diag-header">
+        <div>
+          <div class="diag-eyebrow">运行状况</div>
+          <h1>诊断中心</h1>
+          <p>查看当前日志、本机组件位置和应用数据目录，定位启动、更新和组件问题。</p>
+        </div>
+        <div class="diag-actions">
+          <button id="exportBundleBtn" class="secondary-button">导出诊断包</button>
+          <button id="openLogsBtn" class="secondary-button">显示日志目录</button>
+          <button id="refreshBtn" class="primary-button">刷新</button>
+        </div>
+      </header>
+
+      <section class="diag-grid">
+        <article class="diag-card">
+          <div class="card-title">路径信息</div>
+          <div class="path-block">
+            <div>
+              <div class="path-label">日志文件</div>
+              <div class="path-value" id="logPath">读取中…</div>
+            </div>
+            <div>
+              <div class="path-label">数据目录</div>
+              <div class="path-value" id="appDataDir">读取中…</div>
+            </div>
+            <div>
+              <div class="path-label">本机组件</div>
+              <div class="path-value" id="runtimeDir">读取中…</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="diag-card">
+          <div class="card-title">版面与缩放</div>
+          <div class="path-block">
+            <div>
+              <div class="path-label">缩放档位</div>
+              <div class="path-value" id="zoomDeclared">读取中…</div>
+            </div>
+            <div>
+              <div class="path-label">窗口可用版面</div>
+              <div class="path-value" id="zoomLayout">读取中…</div>
+            </div>
+            <div>
+              <div class="path-label">显示引擎行为</div>
+              <div class="path-value" id="zoomEngine">读取中…</div>
+            </div>
+          </div>
+        </article>
+
+        <article class="diag-card">
+          <div class="card-title">当前已检测资产</div>
+          <div id="assetList" class="asset-list">读取中…</div>
+        </article>
+
+        <article class="diag-card">
+          <div class="card-title">启动分段(账本)</div>
+          <pre id="ledgerOutput">暂无账本数据(完成一次启动后生成)。</pre>
+        </article>
+
+        <article class="diag-card">
+          <div class="card-title">更新历史</div>
+          <pre id="updateHistoryOutput">暂无更新历史(完成一次更新后生成)。</pre>
+        </article>
+
+        <article class="diag-card diag-card--log">
+          <div class="card-title">最近日志</div>
+          <pre id="logOutput">读取中…</pre>
+        </article>
+      </section>
+    </main>
+    <script src="./diagnostics.js"></script>
+  </body>
+</html>
