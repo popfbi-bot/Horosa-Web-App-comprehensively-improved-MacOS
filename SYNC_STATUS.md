@@ -1,26 +1,27 @@
-# 镜像同步状态
+# CNB → GitHub 同步状态
 
 | 项 | 值 |
 |---|---|
 | 仓库 | `cnbnasa/Horosa-Web-App-comprehensively-improved-MacOS` |
-| 源 | github.com/popfbi-bot/Horosa-Web-App-comprehensively-improved-MacOS |
-| 最后运行 | 2026-10-06 18:17:20 CST |
+| 方向 | CNB → GitHub（github.com/popfbi-bot/Horosa-Web-App-comprehensively-improved-MacOS） |
+| 最后运行 | 2026-10-08 03:17:21 CST |
 | 耗时 | 4 秒 |
-| 结果 | ✅ 首次同步完成 |
-| 源默认分支 | `main` |
+| 结果 | ✅ 同步完成 |
+| 推送的提交 | f27c00a9 → e7a3554a（快进，11 个提交） |
 
-## 容器自检
+## 说明
 
-| 检查项 | 结果 |
-|---|---|
-| git | git version 2.47.3 |
-| CNB_TOKEN | 已注入(长度27) |
-| 访问 github.com | f27c00a93e2529b0d0d0b145a7822baa67853095	HEAD |
-| 当前 HEAD | `711be30a` |
-| 当前 commit | chore: 首次同步自 GitHub main（保留同步配置） |
-
-## 详情
+本仓库已**取消本机双推**。现在的同步链路是：
 
 ```
-bootstrap → main 711be30a，340 commits
+本机 ──push──> CNB                随时手动
+CNB──crontab(每日 03:17) ──push──> GitHub   失败自动重试
+```
+
+GitHub 侧一天只同步一次，本机不因 GitHub 网络不稳而卡住。
+
+## 本次运行
+
+```
+f27c00a9 → e7a3554a（快进，11 个提交）
 ```
